@@ -375,18 +375,24 @@ extern "C" __declspec(dllexport) bool isasciistring(const unsigned char* data, i
 extern "C" __declspec(dllexport) bool isunicodestring(const unsigned char* data, int maxlen)
 {
     int len = 0;
-    wchar_t* safebuffer;
-    try
-    {
-        safebuffer = new wchar_t[maxlen];
-    }
-    catch(const std::bad_alloc &)
-    {
+    wchar_t* safebuffer = new wchar_t[maxlen];
+    if(!safebuffer)
         return false;
-    }
-
-    for(const wchar_t* p = (const wchar_t*)data; *p && len < maxlen - 1; len += sizeof(wchar_t), p++)
+	
+	//修改开始
+	//严格匹配汉字
+	if (((unsigned char)data[0] < 0x34) || ((unsigned char)data[0] > 0x80))
+	{
+		return false;
+	}
+	else if (((unsigned char)data[0] == 0x4D) && ((unsigned char)data[1] > 0xB5))
+	{
+		return false;
+	}//修改结束
+    for(const wchar_t* p = (const wchar_t*)data; *p; len += sizeof(wchar_t), p++)
     {
+        if(len >= maxlen)
+            break;
         safebuffer[p - (const wchar_t*)data] = *p;
     }
 
@@ -395,7 +401,7 @@ extern "C" __declspec(dllexport) bool isunicodestring(const unsigned char* data,
         delete[] safebuffer;
         return false;
     }
-    safebuffer[len / sizeof(wchar_t)] = 0; // Mark the end of string
+    safebuffer[len / sizeof(wchar_t) - 1] = 0; // Mark the end of string
 
     String data2;
     WString wdata2;
@@ -416,6 +422,54 @@ extern "C" __declspec(dllexport) bool isunicodestring(const unsigned char* data,
     return true;
 }
 
+extern "C" __declspec(dllexport) bool isutf8string(const unsigned char* data, int maxlen)
+{
+	int len = 0;
+	char* safebuffer = new char[maxlen];
+	if (!safebuffer)
+		return false;
+	for (const char* p = (const char*)data; *p; len++, p++)
+	{
+		if (len >= maxlen)
+			break;
+		safebuffer[p - (const char*)data] = *p;
+	}
+
+	if (len < 2)
+	{
+		delete[] safebuffer;
+		return false;
+	}
+	safebuffer[len] = 0; // Mark the end of string
+	bool isutf8 = false;
+
+	//只匹配三字节表示的汉字
+	if (((unsigned char)safebuffer[0] >= 0xE3) && ((unsigned char)safebuffer[0] <= 0xE9))
+	{
+		if (((unsigned char)safebuffer[1] >= 0x80) && ((unsigned char)safebuffer[1] <= 0xBF))
+		{
+			if (((unsigned char)safebuffer[2] >= 0x80) && ((unsigned char)safebuffer[2] <= 0xBF))
+			{
+				isutf8 = true;
+			}
+			else
+			{
+				isutf8 = false;
+			}
+		}
+		else
+		{
+			isutf8 = false;
+		}
+	}
+	else
+	{
+		isutf8 = false;
+	}
+	return isutf8;
+}
+
+
 bool disasmispossiblestring(duint addr, STRING_TYPE* type)
 {
     unsigned char data[60];
@@ -435,10 +489,18 @@ bool disasmispossiblestring(duint addr, STRING_TYPE* type)
             *type = str_unicode;
         return true;
     }
+	//修改开始
+	if (isutf8string(data, sizeof(data) + 1))
+	{
+		if (type)
+			*type = str_utf8;
+		return true;
+	}//修改结束
     if(type)
         *type = str_none;
     return false;
 }
+
 
 bool disasmgetstringat(duint addr, STRING_TYPE* type, char* ascii, char* unicode, int maxlen)
 {
@@ -486,7 +548,24 @@ bool disasmgetstringat(duint addr, STRING_TYPE* type, char* ascii, char* unicode
         strncpy_s(unicode, std::min(int(escaped.length()) + 1, maxlen), escaped.c_str(), _TRUNCATE);
         return true;
     }
+ 	    //修改开始
+	   if (isutf8string(data(), maxlen))
+	   {
+		     if (type)
+			         *type = str_utf8;
 
+		     // Convert UTF-16 string to UTF-8
+       std::string asciiData2 = (const char*)data();
+		     memcpy(asciiData, asciiData2.c_str(), min((size_t(maxlen) + 1) * 2, asciiData2.size() + 1));
+
+		     // Escape the string
+		     String escaped = StringUtils::Escape(asciiData);
+
+		     // Copy data back to outgoing parameter
+		     strncpy_s(unicode, min(int(escaped.length()) + 1, maxlen), escaped.c_str(), _TRUNCATE);
+       return true;
+	    }
+	    //修改结束
     return false;
 }
 
@@ -508,30 +587,63 @@ bool disasmgetstringatwrapper(duint addr, char* dest, bool cache)
     duint addrPtr = readValidPtr(addr);
     STRING_TYPE strtype;
     auto possibleUnicode = disasmispossiblestring(addr, &strtype) && strtype == str_unicode;
-    if(addrPtr && !possibleUnicode)
-    {
-        if(disasmgetstringat(addrPtr, &strtype, string, string, MAX_STRING_SIZE - 5))
-        {
-            if(int(strlen(string)) <= (strtype == str_ascii ? 3 : 2) && readValidPtr(addrPtr))
-                return false;
-            if(strtype == str_ascii)
-                sprintf_s(dest, MAX_STRING_SIZE, "&\"%s\"", string);
-            else //unicode
-                sprintf_s(dest, MAX_STRING_SIZE, "&L\"%s\"", string);
-            return true;
-        }
-    }
-    if(disasmgetstringat(addr, &strtype, string, string, MAX_STRING_SIZE - 4))
-    {
-        if(strtype == str_ascii)
-            sprintf_s(dest, MAX_STRING_SIZE, "\"%s\"", string);
-        else //unicode
-            sprintf_s(dest, MAX_STRING_SIZE, "L\"%s\"", string);
-        return true;
-    }
+	//修改开始-by WangRui 20210107
+	auto possibleUtf8 = disasmispossiblestring(addr, &strtype) && strtype == str_utf8;
+	auto possibleAscii = disasmispossiblestring(addr, &strtype) && strtype == str_ascii;
+	if (possibleAscii)  //addrPtr &&possibleAscii
+	{
+		if (disasmgetstringat(addr, &strtype, string, string, MAX_STRING_SIZE - 5))  //addrPtr
+		{
+			if (strtype == str_ascii)
+				sprintf_s(dest, MAX_STRING_SIZE, "\"%s\"", string);
+			else if (strtype == str_unicode)//unicode
+				sprintf_s(dest, MAX_STRING_SIZE, "L\"%s\"", string);
+			else if (strtype == str_utf8)
+				sprintf_s(dest, MAX_STRING_SIZE, "F\"%s\"", string);
+			return true;
+		}
+	}
+	if (possibleUnicode){
+		if (disasmgetstringat(addr, &strtype, string, string, MAX_STRING_SIZE - 4))
+		{
+			if (strtype == str_ascii)
+				sprintf_s(dest, MAX_STRING_SIZE, "&\"%s\"", string);
+			else if (strtype == str_unicode)//unicode
+				sprintf_s(dest, MAX_STRING_SIZE, "&L\"%s\"", string);
+			else if (strtype == str_utf8)
+				sprintf_s(dest, MAX_STRING_SIZE, "&F\"%s\"", string);
+			return true;
+		}
+	}
+	if (possibleUtf8){
+		if (disasmgetstringat(addr, &strtype, string, string, MAX_STRING_SIZE - 4))
+		{
+			if (strtype == str_ascii)
+				sprintf_s(dest, MAX_STRING_SIZE, "#\"%s\"", string);
+			else if (strtype == str_unicode)//unicode
+				sprintf_s(dest, MAX_STRING_SIZE, "#L\"%s\"", string);
+			else if (strtype == str_utf8)
+				sprintf_s(dest, MAX_STRING_SIZE, "#F\"%s\"", string);
+			return true;
+		}
+	}
+	if (addrPtr && !possibleAscii &&!possibleUnicode &&!possibleUtf8)
+	{
+		if (disasmgetstringat(addrPtr, &strtype, string, string, MAX_STRING_SIZE - 5))  //addrPtr
+		{
+			if (int(strlen(string)) <= (strtype == str_ascii ? 3 : 2) && readValidPtr(addrPtr))  //addrPtr
+				return false;
+			if (strtype == str_ascii)
+				sprintf_s(dest, MAX_STRING_SIZE, "\"%s\"", string);
+			else if (strtype == str_unicode)//unicode
+				sprintf_s(dest, MAX_STRING_SIZE, "L\"%s\"", string);
+			else if (strtype == str_utf8)
+				sprintf_s(dest, MAX_STRING_SIZE, "F\"%s\"", string);
+			return true;
+		}
+	}
     return false;
 }
-
 int disasmgetsize(duint addr, unsigned char* data)
 {
     Zydis zydis;
